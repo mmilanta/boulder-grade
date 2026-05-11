@@ -1,0 +1,15 @@
+[project]
+name = "vl-predictor"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "arviz>=0.18",
+    "ipykernel>=7.2.0",
+    "matplotlib>=3.10.9",
+    "pymc>=5.0",
+    "scipy>=1.10",
+    "torch>=2.0",
+    "tqdm",
+]
