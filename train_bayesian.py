@@ -1,6 +1,5 @@
 import argparse
 import json
-import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -71,13 +70,22 @@ def compute_bayesian_grade_r2(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Bayesian bouldering model with PyMC")
     parser.add_argument("--mode", default="per_crag", choices=["per_crag", "full"])
+    parser.add_argument("--method", default="advi",
+                        choices=["advi", "fullrank_advi", "nuts"])
     parser.add_argument("--n-iter", type=int, default=50000,
-                        help="Number of ADVI iterations")
+                        help="Number of iterations (ADVI / fullrank)")
+    parser.add_argument("--draws", type=int, default=2000,
+                        help="Posterior draws (NUTS) or samples from approx")
+    parser.add_argument("--tune", type=int, default=2000,
+                        help="NUTS tuning steps")
+    parser.add_argument("--chains", type=int, default=4,
+                        help="NUTS chains")
+    parser.add_argument("--cores", type=int, default=4,
+                        help="NUTS cores")
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--lr", type=float, default=0.003)
     parser.add_argument("--neg-ratio", type=float, default=3.0,
                         help="Ratio of negative to positive samples")
-    parser.add_argument("--dataset", default="data/dataset.pt")
     parser.add_argument("--boulders", default="data/boulders.jsonl")
     args = parser.parse_args()
 
@@ -85,11 +93,11 @@ if __name__ == "__main__":
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run directory: {run_dir}")
 
-    build_dataset(mode=args.mode, output_path=args.dataset)
-    shutil.copy2(args.dataset, run_dir / "dataset.pt")
+    dataset_path = str(run_dir / "dataset.pt")
+    build_dataset(mode=args.mode, output_path=dataset_path)
 
     all_climber, all_boulder, all_label, n_climbers, n_boulders = load_and_prepare_data(
-        args.dataset, neg_ratio=args.neg_ratio
+        dataset_path, neg_ratio=args.neg_ratio
     )
     print(f"Data: {len(all_climber):,} samples")
 
@@ -103,24 +111,32 @@ if __name__ == "__main__":
     )
 
     with model:
-        approx = pm.fit(
-            n=args.n_iter,
-            method="advi",
-            callbacks=[
-                pm.callbacks.CheckParametersConvergence(
-                    diff="absolute", tolerance=1e-3
-                ),
-            ],
-            progressbar=True,
-            obj_optimizer=pm.adam(learning_rate=args.lr),
-        )
+        if args.method == "nuts":
+            idata = pm.sample(
+                draws=args.draws,
+                tune=args.tune,
+                chains=args.chains,
+                cores=args.cores,
+            )
+        elif args.method in ("advi", "fullrank_advi"):
+            approx = pm.fit(
+                n=args.n_iter,
+                method=args.method,
+                callbacks=[
+                    pm.callbacks.CheckParametersConvergence(
+                        diff="absolute", tolerance=1e-3
+                    ),
+                ],
+                progressbar=True,
+                obj_optimizer=pm.adam(learning_rate=args.lr),
+            )
+            idata = approx.sample(draws=args.draws)
 
-    idata = approx.sample(draws=500)
     idata_path = run_dir / "posterior.nc"
     idata.to_netcdf(str(idata_path))
     print(f"Posterior samples saved to {idata_path}")
 
-    data = torch.load(args.dataset, weights_only=True)
+    data = torch.load(dataset_path, weights_only=True)
     r2 = compute_bayesian_grade_r2(idata, args.boulders, data["boulder_to_idx"])
     print(f"n={r2['n']}")
     print(f"R² (difficulty only): {r2['r2_diff_only']:.4f}")

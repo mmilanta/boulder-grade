@@ -65,11 +65,6 @@ def build_model(
         pi = pm.Normal("pi", mu=0, sigma=sigma_popularity, shape=n_boulders)
 
         beta = pm.Normal("beta", mu=0.0, sigma=2.0)
-        log_gamma = pm.Normal("log_gamma", mu=0.0, sigma=1.0)
-        mu = pm.Normal("mu", mu=0.0, sigma=2.0)
-
-        gamma = pt.exp(log_gamma)
-
         c_mb, b_mb, l_mb = pm.Minibatch(
             climber_data, boulder_data, label_data,
             batch_size=batch_size,
@@ -81,9 +76,8 @@ def build_model(
         pi_j = pi[b_mb]
 
         diff = theta_i - d_j
-        delta_mu = diff - mu
 
-        logit_try = alpha_i + pi_j - gamma * delta_mu**2
+        logit_try = alpha_i + pi_j
         logit_send = diff
         logit_flash = diff - beta
 
@@ -109,14 +103,13 @@ def build_model(
 
 
 def get_predictive_probs(
-    theta_val, alpha_val, d_val, pi_val, beta_val, gamma_val, mu_val,
+    theta_val, alpha_val, d_val, pi_val, beta_val
 ):
     from scipy.special import expit as sigmoid
 
     diff = theta_val - d_val
-    delta_mu = diff - mu_val
 
-    logit_try = alpha_val + pi_val - gamma_val * delta_mu**2
+    logit_try = alpha_val + pi_val
     logit_send = diff
     logit_flash = diff - beta_val
 
@@ -150,8 +143,6 @@ def predict_pair(
     d_samples = posterior["d"].values[0, :, boulder_idx]
     pi_samples = posterior["pi"].values[0, :, boulder_idx]
     beta_samples = posterior["beta"].values[0, :]
-    log_gamma_samples = posterior["log_gamma"].values[0, :]
-    mu_samples = posterior["mu"].values[0, :]
 
     n_samples = len(theta_samples)
 
@@ -164,15 +155,12 @@ def predict_pair(
     }
 
     for s in range(n_samples):
-        gamma_s = np.exp(float(log_gamma_samples[s]))
         probs = get_predictive_probs(
             float(theta_samples[s]),
             float(alpha_samples[s]),
             float(d_samples[s]),
             float(pi_samples[s]),
             float(beta_samples[s]),
-            gamma_s,
-            float(mu_samples[s]),
         )
         for k in results:
             results[k].append(probs[k])
