@@ -28,6 +28,7 @@ def build_dataset(
     climber_ids = set()
     boulder_ids_with_data = set()
     crag_slugs = set()
+    sector_keys = set()
     positives = []
     climber_visited_boulders = defaultdict(set)
     climber_visited_crags = defaultdict(set)
@@ -48,10 +49,13 @@ def build_dataset(
 
             boulder = boulders_by_id[bid]
             crag = boulder["crag_slug"]
+            sector = boulder.get("sector_slug") or ""
+            sector_key = (crag, sector)
 
             climber_ids.add(cid)
             boulder_ids_with_data.add(bid)
             crag_slugs.add(crag)
+            sector_keys.add(sector_key)
 
             climber_visited_boulders[cid].add(bid)
             climber_visited_crags[cid].add(crag)
@@ -122,6 +126,22 @@ def build_dataset(
 
     print(f"Negative samples: {len(n_climber_list)}")
 
+    sector_to_idx = {key: i for i, key in enumerate(sorted(sector_keys))}
+    # Map boulder_idx → crag_idx / sector_idx for hierarchical priors.
+    sorted_boulders = sorted(boulder_to_idx.items(), key=lambda kv: kv[1])
+    boulder_crag_idx = torch.tensor(
+        [crag_to_idx[boulder_to_crag[bid]] for bid, _ in sorted_boulders],
+        dtype=torch.long,
+    )
+    boulder_sector_idx = torch.tensor(
+        [
+            sector_to_idx[(boulders_by_id[bid]["crag_slug"], boulders_by_id[bid].get("sector_slug") or "")]
+            for bid, _ in sorted_boulders
+        ],
+        dtype=torch.long,
+    )
+    print(f"Sectors: {len(sector_to_idx)}")
+
     torch.save(
         {
             "p_climber": p_climber,
@@ -133,8 +153,13 @@ def build_dataset(
             "climber_to_idx": climber_to_idx,
             "boulder_to_idx": boulder_to_idx,
             "crag_to_idx": crag_to_idx,
+            "sector_to_idx": sector_to_idx,
+            "boulder_crag_idx": boulder_crag_idx,
+            "boulder_sector_idx": boulder_sector_idx,
             "n_climbers": n_climbers,
             "n_boulders": n_boulders,
+            "n_crags": len(crag_to_idx),
+            "n_sectors": len(sector_to_idx),
         },
         output_path,
     )

@@ -36,7 +36,7 @@ def train(
     if checkpoint:
         model.load_state_dict(torch.load(checkpoint, weights_only=True))
         print(f"Loaded checkpoint from {checkpoint}")
-
+    print(f"Running training on {device}")
     p_label = data["p_label"]
     class_weights = build_class_weights(p_label, len(data["n_label"]), device)
     loss_fn = BoulderingLoss(class_weights)

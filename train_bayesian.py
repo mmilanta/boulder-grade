@@ -20,7 +20,7 @@ def compute_bayesian_grade_r2(
     d_mean, d_std = boulder_difficulty_summary(idata)
 
     posterior = idata.posterior
-    pi_mean = posterior["pi"].values[0].mean(axis=0)
+    pi_mean = posterior["pi"].stack(sample=("chain", "draw")).values.mean(axis=-1)
 
     idx_to_boulder = {v: k for k, v in boulder_to_idx.items()}
 
@@ -86,6 +86,14 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=0.003)
     parser.add_argument("--neg-ratio", type=float, default=3.0,
                         help="Ratio of negative to positive samples")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Seed for negative sampling and inference")
+    parser.add_argument("--eval-every", type=int, default=5000,
+                        help="During ADVI, sample posterior + log grade-R² + checkpoint every N iter (0=off)")
+    parser.add_argument("--hierarchy", default="none", choices=["none", "crag", "sector"],
+                        help="2-level hierarchical prior on d, pooling boulders within this group")
+    parser.add_argument("--per-climber-try", action="store_true",
+                        help="Per-climber Goldilocks try curve (gamma_i, mu_try_i)")
     parser.add_argument("--boulders", default="data/boulders.jsonl")
     args = parser.parse_args()
 
@@ -93,22 +101,61 @@ if __name__ == "__main__":
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run directory: {run_dir}")
 
+    with open(run_dir / "config.json", "w") as f:
+        json.dump(vars(args), f, indent=2)
+
     dataset_path = str(run_dir / "dataset.pt")
     build_dataset(mode=args.mode, output_path=dataset_path)
 
-    all_climber, all_boulder, all_label, n_climbers, n_boulders = load_and_prepare_data(
-        dataset_path, neg_ratio=args.neg_ratio
+    prep = load_and_prepare_data(
+        dataset_path, neg_ratio=args.neg_ratio, seed=args.seed,
     )
-    print(f"Data: {len(all_climber):,} samples")
+    print(f"Data: {len(prep['climber']):,} samples")
+
+    if args.hierarchy == "crag":
+        group_idx, n_groups, group_name = prep["boulder_crag_idx"], prep["n_crags"], "crag"
+    elif args.hierarchy == "sector":
+        group_idx, n_groups, group_name = prep["boulder_sector_idx"], prep["n_sectors"], "sector"
+    else:
+        group_idx, n_groups, group_name = None, 0, "group"
 
     model = build_model(
-        n_climbers=n_climbers,
-        n_boulders=n_boulders,
-        climber_data=all_climber,
-        boulder_data=all_boulder,
-        label_data=all_label,
+        n_climbers=prep["n_climbers"],
+        n_boulders=prep["n_boulders"],
+        climber_data=prep["climber"],
+        boulder_data=prep["boulder"],
+        label_data=prep["label"],
         batch_size=args.batch_size,
+        boulder_group_idx=group_idx,
+        n_groups=n_groups,
+        group_name=group_name,
+        per_climber_try=args.per_climber_try,
     )
+
+    data = torch.load(dataset_path, weights_only=True)
+
+    checkpoints_dir = run_dir / "checkpoints"
+    checkpoints_dir.mkdir(exist_ok=True)
+    val_log_path = run_dir / "validation_log.jsonl"
+
+    def _log_r2(approx, losses, i):  # pymc callback signature: (approx, losses, i)
+        del losses
+        if args.eval_every <= 0 or i == 0 or i % args.eval_every != 0:
+            return
+        try:
+            tmp_idata = approx.sample(draws=args.draws)
+            r2 = compute_bayesian_grade_r2(tmp_idata, args.boulders, data["boulder_to_idx"])
+
+            ckpt_path = checkpoints_dir / f"posterior_iter{i:07d}.nc"
+            tmp_idata.to_netcdf(str(ckpt_path))
+
+            with open(val_log_path, "a") as f:
+                f.write(json.dumps({"iter": i, **r2, "checkpoint": ckpt_path.name}) + "\n")
+
+            print(f"  [iter {i:>7d}] R²_diff={r2['r2_diff_only']:.4f}  "
+                  f"R²_diff+pop={r2['r2_full']:.4f}  n={r2['n']}  → {ckpt_path.name}")
+        except Exception as e:
+            print(f"  [iter {i:>7d}] R² eval failed: {e}")
 
     with model:
         if args.method == "nuts":
@@ -117,18 +164,23 @@ if __name__ == "__main__":
                 tune=args.tune,
                 chains=args.chains,
                 cores=args.cores,
+                random_seed=args.seed,
             )
         elif args.method in ("advi", "fullrank_advi"):
+            callbacks = [
+                pm.callbacks.CheckParametersConvergence(
+                    diff="absolute", tolerance=1e-3
+                ),
+            ]
+            if args.eval_every > 0:
+                callbacks.append(_log_r2)
             approx = pm.fit(
                 n=args.n_iter,
                 method=args.method,
-                callbacks=[
-                    pm.callbacks.CheckParametersConvergence(
-                        diff="absolute", tolerance=1e-3
-                    ),
-                ],
+                callbacks=callbacks,
                 progressbar=True,
                 obj_optimizer=pm.adam(learning_rate=args.lr),
+                random_seed=args.seed,
             )
             idata = approx.sample(draws=args.draws)
 
@@ -136,7 +188,6 @@ if __name__ == "__main__":
     idata.to_netcdf(str(idata_path))
     print(f"Posterior samples saved to {idata_path}")
 
-    data = torch.load(dataset_path, weights_only=True)
     r2 = compute_bayesian_grade_r2(idata, args.boulders, data["boulder_to_idx"])
     print(f"n={r2['n']}")
     print(f"R² (difficulty only): {r2['r2_diff_only']:.4f}")
