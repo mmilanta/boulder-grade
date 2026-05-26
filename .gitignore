@@ -10,6 +10,4 @@ wheels/
 .venv
 runs/
 data/dataset.pt
-data/ascents.jsonl
-data/boulders.jsonl
 .env
