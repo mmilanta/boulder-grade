@@ -3,13 +3,12 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import pymc as pm
 import torch
 
 from vl_predictor.bayesian_model import build_model, load_and_prepare_data, boulder_difficulty_summary
 from vl_predictor.dataset import build_dataset
-from vl_predictor.validation import GRADE_MAPPING, _weighted_r2
+from vl_predictor.validation import compute_grade_r2_from_arrays
 
 
 def compute_bayesian_grade_r2(
@@ -17,54 +16,17 @@ def compute_bayesian_grade_r2(
     boulders_path: str,
     boulder_to_idx: dict,
 ):
-    d_mean, d_std = boulder_difficulty_summary(idata)
+    d_mean, _ = boulder_difficulty_summary(idata)
 
     posterior = idata.posterior
     pi_mean = posterior["pi"].stack(sample=("chain", "draw")).values.mean(axis=-1)
 
-    idx_to_boulder = {v: k for k, v in boulder_to_idx.items()}
-
-    boulder_meta = {}
-    with open(boulders_path) as f:
-        for line in f:
-            b = json.loads(line)
-            boulder_meta[b["boulder_id"]] = b
-
-    grades = []
-    diffs = []
-    pops = []
-    weights = []
-
-    for i in range(len(d_mean)):
-        bid = idx_to_boulder.get(i)
-        if bid is None:
-            continue
-        meta = boulder_meta.get(bid)
-        if meta is None:
-            continue
-        grade_num = GRADE_MAPPING.get(meta.get("grade_community", ""))
-        if grade_num is None:
-            continue
-        ascents = meta.get("ascent_count", 0)
-        grades.append(grade_num)
-        diffs.append(float(d_mean[i]))
-        pops.append(float(pi_mean[i]))
-        weights.append(ascents)
-
-    grades = np.array(grades)
-    diffs = np.array(diffs)
-    pops = np.array(pops)
-    weights = np.array(weights, dtype=float) ** 2
-    weights = weights / weights.sum()
-
-    n = len(grades)
-    if n < 3:
-        return {"r2_diff_only": float("nan"), "r2_full": float("nan"), "n": n}
-
-    r2_diff_only = _weighted_r2(diffs.reshape(-1, 1), grades, weights)
-    r2_full = _weighted_r2(np.stack([diffs, pops], axis=1), grades, weights)
-
-    return {"r2_diff_only": r2_diff_only, "r2_full": r2_full, "n": n}
+    return compute_grade_r2_from_arrays(
+        difficulty=d_mean,
+        popularity=pi_mean,
+        boulder_to_idx=boulder_to_idx,
+        boulders_path=boulders_path,
+    )
 
 
 if __name__ == "__main__":
@@ -94,8 +56,14 @@ if __name__ == "__main__":
                         help="2-level hierarchical prior on d, pooling boulders within this group")
     parser.add_argument("--per-climber-try", action="store_true",
                         help="Per-climber Goldilocks try curve (gamma_i, mu_try_i)")
+    parser.add_argument("--n-dims", type=int, default=1,
+                        help="Number of latent ability/difficulty dimensions")
     parser.add_argument("--boulders", default="data/boulders.jsonl")
     args = parser.parse_args()
+    if args.n_dims < 1:
+        raise ValueError("--n-dims must be >= 1")
+    if args.neg_ratio < 0:
+        raise ValueError("--neg-ratio must be >= 0")
 
     run_dir = Path("runs") / ("bayesian_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -105,7 +73,12 @@ if __name__ == "__main__":
         json.dump(vars(args), f, indent=2)
 
     dataset_path = str(run_dir / "dataset.pt")
-    build_dataset(mode=args.mode, output_path=dataset_path)
+    build_dataset(
+        mode=args.mode,
+        output_path=dataset_path,
+        negative_sample_ratio=args.neg_ratio,
+        seed=args.seed,
+    )
 
     prep = load_and_prepare_data(
         dataset_path, neg_ratio=args.neg_ratio, seed=args.seed,
@@ -130,6 +103,7 @@ if __name__ == "__main__":
         n_groups=n_groups,
         group_name=group_name,
         per_climber_try=args.per_climber_try,
+        n_dims=args.n_dims,
     )
 
     data = torch.load(dataset_path, weights_only=True)

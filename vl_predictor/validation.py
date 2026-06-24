@@ -25,7 +25,23 @@ def compute_grade_r2(
 
     difficulty = model.boulder_difficulty.weight.squeeze(-1).detach().cpu().numpy()
     popularity = model.boulder_popularity.weight.squeeze(-1).detach().cpu().numpy()
-    idx_to_boulder = {v: k for k, v in data["boulder_to_idx"].items()}
+    return compute_grade_r2_from_arrays(
+        difficulty=difficulty,
+        popularity=popularity,
+        boulder_to_idx=data["boulder_to_idx"],
+        boulders_path=boulders_path,
+    )
+
+
+def compute_grade_r2_from_arrays(
+    difficulty: np.ndarray,
+    popularity: np.ndarray,
+    boulder_to_idx: dict,
+    boulders_path: str = "data/boulders.jsonl",
+) -> dict:
+    difficulty = np.asarray(difficulty)
+    popularity = np.asarray(popularity)
+    idx_to_boulder = {v: k for k, v in boulder_to_idx.items()}
 
     boulder_meta = {}
     with open(boulders_path) as f:
@@ -50,34 +66,48 @@ def compute_grade_r2(
             continue
         ascents = meta.get("ascent_count", 0)
         grades.append(grade_num)
-        diffs.append(float(difficulty[i]))
+        diffs.append(np.asarray(difficulty[i], dtype=float))
         pops.append(float(popularity[i]))
         weights.append(ascents)
 
     grades = np.array(grades)
     diffs = np.array(diffs)
     pops = np.array(pops)
-    weights = np.array(weights, dtype=float) ** 2
-    weights = weights / weights.sum()
-
     n = len(grades)
     if n < 3:
         return {"r2_diff_only": float("nan"), "r2_full": float("nan"), "n": n}
 
-    r2_diff_only = _weighted_r2(diffs.reshape(-1, 1), grades, weights)
-    r2_full = _weighted_r2(np.stack([diffs, pops], axis=1), grades, weights)
+    weights = _normalized_grade_weights(np.array(weights, dtype=float))
+    diff_features = diffs.reshape(-1, 1) if diffs.ndim == 1 else diffs
+    r2_diff_only = _weighted_r2(diff_features, grades, weights)
+    r2_full = _weighted_r2(np.column_stack([diff_features, pops]), grades, weights)
 
     return {"r2_diff_only": r2_diff_only, "r2_full": r2_full, "n": n}
 
 
+def _normalized_grade_weights(weights: np.ndarray) -> np.ndarray:
+    weights = np.clip(weights, 0.0, None) ** 2
+    total = weights.sum()
+    if not np.isfinite(total) or total <= 0:
+        return np.full(len(weights), 1.0 / len(weights))
+    return weights / total
+
+
 def _weighted_r2(X: np.ndarray, y: np.ndarray, weights: np.ndarray) -> float:
+    if len(y) < 3:
+        return float("nan")
+
     X_design = np.concatenate([X, np.ones((len(y), 1))], axis=1)
-    W = np.diag(weights)
-    coef = np.linalg.inv(X_design.T @ W @ X_design) @ X_design.T @ W @ y
+    sqrt_w = np.sqrt(weights)
+    X_weighted = X_design * sqrt_w[:, None]
+    y_weighted = y * sqrt_w
+    coef = np.linalg.lstsq(X_weighted, y_weighted, rcond=None)[0]
     pred = X_design @ coef
     residuals = y - pred
     ss_res = np.sum(weights * residuals**2)
     ss_tot = np.sum(weights * (y - np.average(y, weights=weights))**2)
+    if not np.isfinite(ss_tot) or ss_tot <= 0:
+        return float("nan")
     return float(1 - ss_res / ss_tot)
 
 

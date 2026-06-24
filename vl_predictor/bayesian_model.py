@@ -23,9 +23,13 @@ def load_and_prepare_data(
     n_neg_sample = min(n_neg_total, int(n_pos * neg_ratio))
 
     rng = np.random.RandomState(seed)
-    neg_idx = rng.choice(n_neg_total, n_neg_sample, replace=False)
-    n_climber = n_climber_full[neg_idx]
-    n_boulder = n_boulder_full[neg_idx]
+    if n_neg_sample > 0:
+        neg_idx = rng.choice(n_neg_total, n_neg_sample, replace=False)
+        n_climber = n_climber_full[neg_idx]
+        n_boulder = n_boulder_full[neg_idx]
+    else:
+        n_climber = np.empty(0, dtype=np.int32)
+        n_boulder = np.empty(0, dtype=np.int32)
     n_label = np.zeros(n_neg_sample, dtype=np.int32)
 
     all_climber = np.concatenate([p_climber, n_climber])
@@ -45,7 +49,7 @@ def load_and_prepare_data(
     n_go = int((all_label == 1).sum())
     n_send = int((all_label == 2).sum())
     n_flash = int((all_label == 3).sum())
-    print(f"Positives: {n_pos:,}  Negatives (sampled): {n_neg_sample:,}  Total: {len(all_climber):,}")
+    print(f"Positives: {n_pos:,}  Negatives used: {n_neg_sample:,}  Total: {len(all_climber):,}")
     print(f"  Labels — neg={n_neg_sample:,}  go={n_go:,}  send={n_send:,}  flash={n_flash:,}")
     print(f"Climbers: {n_climbers:,}  Boulders: {n_boulders:,}  Crags: {n_crags}  Sectors: {n_sectors}")
 
@@ -73,6 +77,7 @@ def build_model(
     n_groups: int = 0,
     group_name: str = "group",
     per_climber_try: bool = False,
+    n_dims: int = 1,
 ):
     """When boulder_group_idx + n_groups are supplied, d gets a 2-level
     hierarchical prior: d_j = d_group[group(j)] + sigma_within * d_raw_j.
@@ -89,7 +94,10 @@ def build_model(
         # Centered for the climber/popularity variables: with ~600k observations
         # per latent group the funnel is well-determined and centered converges
         # much faster than non-centered.
-        theta = pm.Normal("theta", mu=0, sigma=sigma_ability, shape=n_climbers)
+        latent_shape = n_climbers if n_dims == 1 else (n_climbers, n_dims)
+        boulder_shape = n_boulders if n_dims == 1 else (n_boulders, n_dims)
+
+        theta = pm.Normal("theta", mu=0, sigma=sigma_ability, shape=latent_shape)
         alpha = pm.Normal("alpha", mu=0, sigma=sigma_prolificity, shape=n_climbers)
         pi = pm.Normal("pi", mu=0, sigma=sigma_popularity, shape=n_boulders)
 
@@ -99,16 +107,18 @@ def build_model(
         if use_hierarchy:
             sigma_d_between = pm.HalfNormal("sigma_d_between", sigma=2.0)
             sigma_d_within = pm.HalfNormal("sigma_d_within", sigma=2.0)
-            d_group_raw = pm.Normal(f"d_{group_name}_raw", mu=0, sigma=1, shape=n_groups)
+            group_shape = n_groups if n_dims == 1 else (n_groups, n_dims)
+            d_group_raw = pm.Normal(f"d_{group_name}_raw", mu=0, sigma=1, shape=group_shape)
             d_group = pm.Deterministic(f"d_{group_name}", sigma_d_between * d_group_raw)
-            d_raw = pm.Normal("d_raw", mu=0, sigma=1, shape=n_boulders)
+            d_raw = pm.Normal("d_raw", mu=0, sigma=1, shape=boulder_shape)
             group_idx_const = pt.as_tensor_variable(boulder_group_idx.astype(np.int64))
             d = pm.Deterministic("d", d_group[group_idx_const] + sigma_d_within * d_raw)
         else:
             sigma_difficulty = pm.HalfNormal("sigma_difficulty", sigma=2.0)
-            d = pm.Normal("d", mu=0, sigma=sigma_difficulty, shape=n_boulders)
+            d = pm.Normal("d", mu=0, sigma=sigma_difficulty, shape=boulder_shape)
 
-        beta = pm.Normal("beta", mu=0.0, sigma=2.0)
+        raw_beta = pm.Normal("raw_beta", mu=0.0, sigma=1.0)
+        beta = pm.Deterministic("beta", pt.softplus(raw_beta))
         # "Goldilocks" try term — climbers preferentially try problems near
         # their level. With per_climber_try, each climber gets their own
         # (gamma_i, mu_try_i) drawn from a population around the global mean.
@@ -149,17 +159,29 @@ def build_model(
 
         diff = theta_i - d_j
 
-        logit_try = alpha_i + pi_j - gamma_i * (diff - mu_try_i) ** 2
-        logit_send = diff
-        logit_flash = diff - beta
+        if n_dims == 1:
+            try_distance = (diff - mu_try_i) ** 2
+            log_p_send_g_try = -pt.softplus(-diff)
+            log_p_flash_g_send = -pt.softplus(-(diff - beta))
+        else:
+            if per_climber_try:
+                try_centered = diff - mu_try_i[:, None]
+            else:
+                try_centered = diff - mu_try_i
+            try_distance = pt.mean(try_centered ** 2, axis=1)
+            log_p_send_g_try = pt.sum(-pt.softplus(-diff), axis=1)
+            log_p_flash_g_send = pt.sum(-pt.softplus(-(diff - beta)), axis=1)
+
+        logit_try = alpha_i + pi_j - gamma_i * try_distance
 
         # log_sigmoid(x) = -softplus(-x), numerically stable in both tails.
         log_p_try = -pt.softplus(-logit_try)
         log_p_not_try = -pt.softplus(logit_try)
-        log_p_send_g_try = -pt.softplus(-logit_send)
-        log_p_fail_g_try = -pt.softplus(logit_send)
-        log_p_flash_g_send = -pt.softplus(-logit_flash)
-        log_p_noflash_g_send = -pt.softplus(logit_flash)
+
+        p_send_g_try = pt.clip(pt.exp(log_p_send_g_try), 0.0, 1.0 - 1e-9)
+        p_flash_g_send = pt.clip(pt.exp(log_p_flash_g_send), 0.0, 1.0 - 1e-9)
+        log_p_fail_g_try = pt.log1p(-p_send_g_try)
+        log_p_noflash_g_send = pt.log1p(-p_flash_g_send)
 
         # Per-class log-likelihoods. Class 0 (negative) is ambiguous: the climber
         # either didn't try, or tried and failed — sum those two paths via
@@ -188,19 +210,18 @@ def build_model(
 
 def get_predictive_probs(
     theta_val, alpha_val, d_val, pi_val, beta_val,
-    gamma_val=0.0, mu_try_val=0.0,
+    gamma_val=1.0, mu_try_val=0.0,
 ):
     from scipy.special import expit as sigmoid
 
-    diff = theta_val - d_val
+    diff = np.asarray(theta_val) - np.asarray(d_val)
 
-    logit_try = alpha_val + pi_val - gamma_val * (diff - mu_try_val) ** 2
-    logit_send = diff
-    logit_flash = diff - beta_val
+    try_distance = np.mean((diff - mu_try_val) ** 2)
+    logit_try = alpha_val + pi_val - gamma_val * try_distance
 
     p_try = sigmoid(logit_try)
-    p_send_given_try = sigmoid(logit_send)
-    p_flash_given_send = sigmoid(logit_flash)
+    p_send_given_try = np.prod(sigmoid(diff))
+    p_flash_given_send = np.prod(sigmoid(diff - beta_val))
 
     p_negative = (1 - p_try) + p_try * (1 - p_send_given_try)
     p_send = p_try * p_send_given_try * (1 - p_flash_given_send)
@@ -226,15 +247,31 @@ def predict_pair(
     def flat(name):
         return posterior[name].stack(sample=("chain", "draw")).values
 
-    theta_samples = flat("theta")[climber_idx]
+    def latent_samples(name, idx):
+        values = flat(name)[idx]
+        if values.ndim == 1:
+            return values[:, None]
+        return np.moveaxis(values, -1, 0)
+
+    theta_samples = latent_samples("theta", climber_idx)
     alpha_samples = flat("alpha")[climber_idx]
-    d_samples = flat("d")[boulder_idx]
+    d_samples = latent_samples("d", boulder_idx)
     pi_samples = flat("pi")[boulder_idx]
     beta_samples = flat("beta")
-    gamma_samples = flat("gamma") if "gamma" in posterior else np.zeros_like(beta_samples)
-    mu_try_samples = flat("mu_try") if "mu_try" in posterior else np.zeros_like(beta_samples)
+    if "gamma" in posterior:
+        gamma_samples = flat("gamma")
+    elif "gamma_vec" in posterior:
+        gamma_samples = flat("gamma_vec")[climber_idx]
+    else:
+        gamma_samples = np.ones_like(beta_samples)
+    if "mu_try" in posterior:
+        mu_try_samples = flat("mu_try")
+    elif "mu_try_vec" in posterior:
+        mu_try_samples = flat("mu_try_vec")[climber_idx]
+    else:
+        mu_try_samples = np.zeros_like(beta_samples)
 
-    n_samples = len(theta_samples)
+    n_samples = theta_samples.shape[0]
 
     results = {
         "p_try": [],
@@ -246,9 +283,9 @@ def predict_pair(
 
     for s in range(n_samples):
         probs = get_predictive_probs(
-            float(theta_samples[s]),
+            theta_samples[s],
             float(alpha_samples[s]),
-            float(d_samples[s]),
+            d_samples[s],
             float(pi_samples[s]),
             float(beta_samples[s]),
             float(gamma_samples[s]),

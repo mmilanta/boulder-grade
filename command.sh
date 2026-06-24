@@ -13,4 +13,5 @@ uv run python train_bayesian.py \
   --eval-every 50000 \
   --seed 42 \
   --hierarchy sector \
-  --per-climber-try
+  --per-climber-try \
+  --n-dims 3
